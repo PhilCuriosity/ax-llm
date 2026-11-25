@@ -80,6 +80,10 @@ struct LLMAttrType {
     // Keep those snapshots in CMM and copy with D2D instead of doing a host
     // D2H/H2D round trip. Requires an on-chip AX650 build.
     bool linear_state_snapshot_d2d = false;
+    // Copy each linear layer's K/V on a worker thread while the next layer is
+    // running on the NPU, instead of doing one synchronous D2H block after
+    // prefill.
+    bool linear_state_snapshot_async = false;
 
     // ---- Pre-load memory guard (avoid loading models that overflow CMM/DDR
     //      and crash the NPU driver) ----

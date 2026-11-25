@@ -946,6 +946,7 @@ void LLM::Impl::Deinit()
 {
     // Release device-side linear snapshots before the CMM registry and model
     // buffers are torn down so the CMM balance check sees them reclaimed.
+    async_linear_snapshot_.reset();
     linear_state_snapshots_.clear();
     linear_snapshot_pool_k_.clear();
     linear_snapshot_pool_v_.clear();

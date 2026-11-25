@@ -259,6 +259,8 @@ struct LLM::Impl : public IKvSlotHost {
     // these allocations here avoids 36 CMM alloc/free cycles per prefill.
     std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_k_;
     std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_v_;
+    struct AsyncLinearSnapshotContext;
+    std::unique_ptr<AsyncLinearSnapshotContext> async_linear_snapshot_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
@@ -957,6 +959,131 @@ struct LLM::Impl : public IKvSlotHost {
         return buffer;
     }
 #endif
+
+    struct AsyncLinearSnapshotJob
+    {
+        int layer = -1;
+        const void *k = nullptr;
+        size_t k_size = 0;
+        const void *v = nullptr;
+        size_t v_size = 0;
+        int devid = 0;
+    };
+
+    struct AsyncLinearSnapshotContext
+    {
+        int token_len = 0;
+        LinearStateSnapshot snapshot;
+        std::thread worker;
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<AsyncLinearSnapshotJob> jobs;
+        bool stop = false;
+        std::atomic<bool> failed{false};
+
+        ~AsyncLinearSnapshotContext()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                stop = true;
+            }
+            cv.notify_all();
+            if (worker.joinable()) worker.join();
+        }
+    };
+
+    void async_linear_snapshot_worker(AsyncLinearSnapshotContext &ctx)
+    {
+        for (;;)
+        {
+            AsyncLinearSnapshotJob job;
+            {
+                std::unique_lock<std::mutex> lock(ctx.mtx);
+                ctx.cv.wait(lock, [&ctx] { return ctx.stop || !ctx.jobs.empty(); });
+                if (ctx.jobs.empty())
+                {
+                    if (ctx.stop) break;
+                    continue;
+                }
+                job = std::move(ctx.jobs.front());
+                ctx.jobs.pop_front();
+            }
+
+            if (job.layer < 0 || job.layer >= (int)ctx.snapshot.k.size() ||
+                job.layer >= (int)ctx.snapshot.v.size())
+            {
+                ctx.failed.store(true);
+                continue;
+            }
+
+            try
+            {
+                auto &k = ctx.snapshot.k[(size_t)job.layer];
+                auto &v = ctx.snapshot.v[(size_t)job.layer];
+                k.resize(job.k_size);
+                v.resize(job.v_size);
+                llm_d2h(k.data(), job.k, job.k_size, job.devid);
+                llm_d2h(v.data(), job.v, job.v_size, job.devid);
+            }
+            catch (...)
+            {
+                ctx.failed.store(true);
+            }
+        }
+    }
+
+    void start_async_linear_snapshot(int token_len)
+    {
+        async_linear_snapshot_.reset();
+        async_linear_snapshot_ = std::make_unique<AsyncLinearSnapshotContext>();
+        auto &ctx = *async_linear_snapshot_;
+        ctx.token_len = token_len;
+        ctx.snapshot.token_len = token_len;
+        ctx.snapshot.k.resize((size_t)_attr.axmodel_num);
+        ctx.snapshot.v.resize((size_t)_attr.axmodel_num);
+        ctx.worker = std::thread([this, &ctx] { async_linear_snapshot_worker(ctx); });
+    }
+
+    void enqueue_async_linear_snapshot(int layer, const void *k, size_t k_size,
+                                       const void *v, size_t v_size, int devid)
+    {
+        if (!async_linear_snapshot_ || !k || !v) return;
+        {
+            std::lock_guard<std::mutex> lock(async_linear_snapshot_->mtx);
+            async_linear_snapshot_->jobs.push_back(
+                AsyncLinearSnapshotJob{layer, k, k_size, v, v_size, devid});
+        }
+        async_linear_snapshot_->cv.notify_one();
+    }
+
+    bool finish_async_linear_snapshot()
+    {
+        if (!async_linear_snapshot_) return true;
+        auto &ctx = *async_linear_snapshot_;
+        {
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.stop = true;
+        }
+        ctx.cv.notify_all();
+        if (ctx.worker.joinable()) ctx.worker.join();
+
+        const bool ok = !ctx.failed.load();
+        if (ok)
+        {
+            auto *existing = linear_state_snapshots_.find(ctx.token_len);
+            if (existing)
+                *existing = std::move(ctx.snapshot);
+            else
+                linear_state_snapshots_.items().push_back(std::move(ctx.snapshot));
+            ALOGI("async linear snapshot finished (token_len=%d)", ctx.token_len);
+        }
+        else
+        {
+            ALOGE("async linear snapshot failed (token_len=%d)", ctx.token_len);
+        }
+        async_linear_snapshot_.reset();
+        return ok;
+    }
 
     void capture_linear_state_snapshot(int token_len)
     {

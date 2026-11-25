@@ -309,6 +309,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         prefill_grp_list[p] = g;
     }
 
+    const bool skip_linear_snapshot = !_attr.linear_state_snapshot ||
+                                      std::getenv("AXLLM_DISABLE_LINEAR_SNAPSHOT") != nullptr;
+#ifdef USE_AXCL
+    const bool async_linear_snapshot = false;
+#else
+    const bool async_linear_snapshot = !skip_linear_snapshot &&
+                                       _attr.linear_state_snapshot_async &&
+                                       has_linear_attention_layers();
+#endif
+    if (async_linear_snapshot)
+        start_async_linear_snapshot(precompute_len + input_embed_num);
+
     const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
     const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
     const bool decode_profile_enabled = std::getenv("AXLLM_PROFILE_DECODE") != nullptr;
@@ -614,6 +626,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 }
             }
 
+            if (async_linear_snapshot && p == prefill_split_num - 1 && linear_prefill)
+            {
+                enqueue_async_linear_snapshot(m,
+                                              LLM_RADDR(dec_k),
+                                              (size_t)dec_k.nSize,
+                                              LLM_RADDR(dec_v),
+                                              (size_t)dec_v.nSize,
+                                              devid);
+            }
+
             auto &t_out = lyr.layer.get_output(layer_prefill_grpid, "output");
             llm_d2h(embed_tmp.data(), LLM_RADDR(t_out), embed_tmp.size() * sizeof(unsigned short), devid);
             if (debug_prefill) ALOGI("prefill layer %d output d2h done", m);
@@ -660,12 +682,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
 
         mark_full_cache_slots(history_len, input_num_token);
-        const bool skip_linear_snapshot = !_attr.linear_state_snapshot ||
-                                          std::getenv("AXLLM_DISABLE_LINEAR_SNAPSHOT") != nullptr;
         const bool profile_prefill = std::getenv("AXLLM_PROFILE_PREFILL") != nullptr;
-        const auto snapshot_t0 = profile_prefill ? DecodeClock::now() : DecodeClock::time_point{};
-        if (!skip_linear_snapshot)
+        if (!skip_linear_snapshot && !async_linear_snapshot)
         {
+            const auto snapshot_t0 = profile_prefill ? DecodeClock::now() : DecodeClock::time_point{};
             capture_linear_state_snapshot(history_len + input_num_token);
             if (std::getenv("AXLLM_TEST_LINEAR_RESTORE"))
             {
@@ -674,12 +694,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                       restore_ok ? "ok" : "FAILED",
                       history_len + input_num_token);
             }
+            if (profile_prefill)
+            {
+                const double snapshot_ms =
+                    (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - snapshot_t0).count() / 1000.0;
+                ALOGI("prefill linear snapshot: %.2f ms", snapshot_ms);
+            }
         }
-        if (profile_prefill)
+        else if (profile_prefill)
         {
-            const double snapshot_ms =
-                (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - snapshot_t0).count() / 1000.0;
-            ALOGI("prefill linear snapshot: %.2f ms%s", snapshot_ms, skip_linear_snapshot ? " (skipped)" : "");
+            ALOGI("prefill linear snapshot: %s", skip_linear_snapshot ? "skipped" : "async");
         }
         if (p == prefill_split_num - 1)
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
@@ -770,6 +794,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 last_finish_reason_ = "length";
             }
         }
+    }
+
+    if (async_linear_snapshot)
+    {
+        const auto wait_t0 = DecodeClock::now();
+        const bool snapshot_ok = finish_async_linear_snapshot();
+        const double wait_ms =
+            (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - wait_t0).count() / 1000.0;
+        ALOGI("async linear snapshot wait after first token: %.2f ms (%s)",
+              wait_ms, snapshot_ok ? "ok" : "failed");
     }
 
     t_cost.start();
