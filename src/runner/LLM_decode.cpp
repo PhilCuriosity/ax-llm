@@ -660,7 +660,18 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
 
         mark_full_cache_slots(history_len, input_num_token);
-        capture_linear_state_snapshot(history_len + input_num_token);
+        const bool skip_linear_snapshot = !_attr.linear_state_snapshot ||
+                                          std::getenv("AXLLM_DISABLE_LINEAR_SNAPSHOT") != nullptr;
+        const bool profile_prefill = std::getenv("AXLLM_PROFILE_PREFILL") != nullptr;
+        const auto snapshot_t0 = profile_prefill ? DecodeClock::now() : DecodeClock::time_point{};
+        if (!skip_linear_snapshot)
+            capture_linear_state_snapshot(history_len + input_num_token);
+        if (profile_prefill)
+        {
+            const double snapshot_ms =
+                (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - snapshot_t0).count() / 1000.0;
+            ALOGI("prefill linear snapshot: %.2f ms%s", snapshot_ms, skip_linear_snapshot ? " (skipped)" : "");
+        }
         if (p == prefill_split_num - 1)
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
     }
