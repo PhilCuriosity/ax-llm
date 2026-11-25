@@ -804,6 +804,13 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
             (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - wait_t0).count() / 1000.0;
         ALOGI("async linear snapshot wait after first token: %.2f ms (%s)",
               wait_ms, snapshot_ok ? "ok" : "failed");
+        if (snapshot_ok && std::getenv("AXLLM_TEST_LINEAR_RESTORE"))
+        {
+            const bool restore_ok = restore_linear_state_snapshot_to_device(precompute_len + input_embed_num);
+            ALOGI("async linear snapshot restore self-test: %s (token_len=%d)",
+                  restore_ok ? "ok" : "FAILED",
+                  precompute_len + input_embed_num);
+        }
     }
 
     t_cost.start();
