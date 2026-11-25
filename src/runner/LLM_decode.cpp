@@ -665,7 +665,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         const bool profile_prefill = std::getenv("AXLLM_PROFILE_PREFILL") != nullptr;
         const auto snapshot_t0 = profile_prefill ? DecodeClock::now() : DecodeClock::time_point{};
         if (!skip_linear_snapshot)
+        {
             capture_linear_state_snapshot(history_len + input_num_token);
+            if (std::getenv("AXLLM_TEST_LINEAR_RESTORE"))
+            {
+                const bool restore_ok = restore_linear_state_snapshot_to_device(history_len + input_num_token);
+                ALOGI("linear snapshot restore self-test: %s (token_len=%d)",
+                      restore_ok ? "ok" : "FAILED",
+                      history_len + input_num_token);
+            }
+        }
         if (profile_prefill)
         {
             const double snapshot_ms =

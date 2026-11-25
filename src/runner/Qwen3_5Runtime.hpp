@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,12 +18,26 @@ struct AttentionConfig {
     int sliding_window = 0;
 };
 
+// One device-side allocation. ``owner`` keeps the CMM buffer alive and frees
+// it through the backend-specific deleter when the snapshot is dropped.
+struct DeviceBuffer {
+    void *vir = nullptr;
+    unsigned long long phy = 0;
+    std::size_t size = 0;
+    std::shared_ptr<void> owner;
+};
+
 // Linear-attention tensors are opaque state buffers. Keep raw bytes because
 // exported graphs may use BF16/FP16 or FP32 depending on the decode path.
+// When ``device_backed`` is true the K/V state lives in CMM and k/v are empty;
+// otherwise k/v hold the original host-side copies (AXCL/host fallback).
 struct LinearStateSnapshot {
     int token_len = 0;
+    bool device_backed = false;
     std::vector<std::vector<unsigned char>> k;
     std::vector<std::vector<unsigned char>> v;
+    std::vector<DeviceBuffer> device_k;
+    std::vector<DeviceBuffer> device_v;
 };
 
 class LinearStateStore {

@@ -77,6 +77,9 @@ struct LLMAttrType {
     // from the first-token path (~170 ms on Qwen3.5 C192) at the cost of
     // recomputing the prompt when a later turn reuses a prefix.
     bool linear_state_snapshot = true;
+    // Keep those snapshots in CMM and copy with D2D instead of doing a host
+    // D2H/H2D round trip. Requires an on-chip AX650 build.
+    bool linear_state_snapshot_d2d = false;
 
     // ---- Pre-load memory guard (avoid loading models that overflow CMM/DDR
     //      and crash the NPU driver) ----
