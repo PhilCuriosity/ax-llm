@@ -226,6 +226,24 @@ set(OPENAI_API_BUILD_SERVER OFF)
 add_subdirectory(third_party/openai-api.cpp)
 
 # ---------------------------------------------------------------------------
+# Optional libjpeg reduced-resolution JPEG decode.
+# Pass -DAXLLM_JPEG_LIB=/path/to/aarch64/libjpeg.so.8 and
+# -DAXLLM_JPEG_INCLUDE_DIR=/path/to/include to enable.
+# ---------------------------------------------------------------------------
+set(AXLLM_JPEG_LIB "" CACHE FILEPATH "libjpeg library for reduced JPEG decode")
+set(AXLLM_JPEG_INCLUDE_DIR "" CACHE PATH "libjpeg include directory")
+if(AXLLM_JPEG_LIB)
+    if(NOT EXISTS "${AXLLM_JPEG_LIB}")
+        message(FATAL_ERROR "AXLLM_JPEG_LIB does not exist: ${AXLLM_JPEG_LIB}")
+    endif()
+    add_compile_definitions(AXLLM_HAVE_LIBJPEG=1)
+    include_directories(${AXLLM_JPEG_INCLUDE_DIR})
+    include_directories(${AXLLM_JPEG_INCLUDE_DIR}/x86_64-linux-gnu)
+    link_libraries(${AXLLM_JPEG_LIB})
+    message(STATUS "libjpeg reduced decode: ${AXLLM_JPEG_LIB}")
+endif()
+
+# ---------------------------------------------------------------------------
 # 两个后端共用的源文件
 # ---------------------------------------------------------------------------
 set(COMMON_SOURCES

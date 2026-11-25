@@ -134,6 +134,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     if (src_w == dst_w && src_h == dst_h)
     {
         output_rgb.resize((size_t)dst_w * (size_t)dst_h * 3);
+#pragma omp parallel for schedule(static)
         for (int y = 0; y < src_h; ++y)
         {
             const uint8_t* sp = axcv::row_ptr(src_bgr, y);
@@ -152,6 +153,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     // Convert to Pillow-like RGBX (4 bytes per pixel, X=0) for bit-exact resampling.
     const size_t src_step = (size_t)src_w * 4;
     std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < src_h; ++y)
     {
         const uint8_t* sp = axcv::row_ptr(src_bgr, y);
@@ -173,6 +175,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
     // Horizontal pass: [src_h, dst_w, 4]
     const size_t tmp_step = (size_t)dst_w * 4;
     std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
+#pragma omp parallel for schedule(static)
     for (int yy = 0; yy < src_h; ++yy)
     {
         const uint8_t* row = src_rgbx.data() + (size_t)yy * (size_t)src_step;
@@ -204,6 +207,7 @@ static bool pillow_resize_bgr_to_rgb_u8(const axcv::Mat& src_bgr, std::vector<un
 
     // Vertical pass -> RGB output [dst_h, dst_w, 3]
     output_rgb.resize((size_t)dst_h * (size_t)dst_w * 3);
+#pragma omp parallel for schedule(static)
     for (int yy = 0; yy < dst_h; ++yy)
     {
         const int ymin = ycoeff.bounds[(size_t)yy * 2 + 0];
@@ -254,6 +258,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
 
     const size_t src_step = (size_t)src_w * 4;
     std::vector<uint8_t> src_rgbx((size_t)src_h * (size_t)src_step);
+#pragma omp parallel for schedule(static)
     for (int y = 0; y < src_h; ++y)
     {
         const uint8_t* sp = src_rgb.data() + (size_t)y * (size_t)src_w * 3;
@@ -273,6 +278,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
 
     const size_t tmp_step = (size_t)dst_w * 4;
     std::vector<uint8_t> tmp_rgbx((size_t)src_h * (size_t)tmp_step, 0);
+#pragma omp parallel for schedule(static)
     for (int yy = 0; yy < src_h; ++yy)
     {
         const uint8_t* row = src_rgbx.data() + (size_t)yy * (size_t)src_step;
@@ -302,6 +308,7 @@ static bool pillow_resize_rgb_u8(const std::vector<unsigned char>& src_rgb,
     }
 
     output_rgb.resize((size_t)dst_h * (size_t)dst_w * 3);
+#pragma omp parallel for schedule(static)
     for (int yy = 0; yy < dst_h; ++yy)
     {
         const int ymin = ycoeff.bounds[(size_t)yy * 2 + 0];
