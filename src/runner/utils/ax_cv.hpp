@@ -29,6 +29,7 @@ inline int step_bytes(const Mat& m) { return (int)m.step; }
 inline const uint8_t* row_ptr(const Mat& m, int y) { return m.ptr<uint8_t>(y); }
 inline uint8_t* row_ptr(Mat& m, int y) { return m.ptr<uint8_t>(y); }
 
+inline Mat create_mat(int h, int w, int c) { return cv::Mat(h, w, CV_8UC(c)); }
 inline Mat imread(const std::string& path, int flags = IMREAD_COLOR) { return cv::imread(path, flags); }
 
 inline void resize(const Mat& src, Mat& dst, int dst_w, int dst_h)
@@ -63,6 +64,8 @@ inline int channels(const Mat& m) { return m.channels; }
 inline int step_bytes(const Mat& m) { return m.step; }
 inline const uint8_t* row_ptr(const Mat& m, int y) { return (const uint8_t*)(m.data + (size_t)y * (size_t)m.step); }
 inline uint8_t* row_ptr(Mat& m, int y) { return (uint8_t*)(m.data + (size_t)y * (size_t)m.step); }
+
+inline Mat create_mat(int h, int w, int c) { return SimpleCV::Mat(h, w, c); }
 
 inline Mat imread(const std::string& path, int /*flags*/ = IMREAD_COLOR)
 {

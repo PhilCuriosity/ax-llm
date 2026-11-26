@@ -944,6 +944,12 @@ bool LLM::Impl::Init(LLMAttrType attr)
 
 void LLM::Impl::Deinit()
 {
+    // Release device-side linear snapshots before the CMM registry and model
+    // buffers are torn down so the CMM balance check sees them reclaimed.
+    async_linear_snapshots_.clear();
+    linear_state_snapshots_.clear();
+    linear_snapshot_pool_k_.clear();
+    linear_snapshot_pool_v_.clear();
 #ifndef USE_AXCL
     // Drop write-site flush mappings before their CMM blocks are freed.
     CmmFlushRegistry::instance().clear_all();

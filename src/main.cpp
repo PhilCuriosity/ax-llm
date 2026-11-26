@@ -668,6 +668,18 @@ struct ModelConfig
             {
                 attr.vision_cache_dir = j["vision_cache_dir"].get<std::string>();
             }
+            if (j.contains("linear_state_snapshot"))
+            {
+                attr.linear_state_snapshot = j["linear_state_snapshot"].get<bool>();
+            }
+            if (j.contains("linear_state_snapshot_d2d"))
+            {
+                attr.linear_state_snapshot_d2d = j["linear_state_snapshot_d2d"].get<bool>();
+            }
+            if (j.contains("linear_state_snapshot_async"))
+            {
+                attr.linear_state_snapshot_async = j["linear_state_snapshot_async"].get<bool>();
+            }
 
             if (j.contains("vision_width")) attr.vision_width = j["vision_width"].get<int>();
             if (j.contains("vision_height")) attr.vision_height = j["vision_height"].get<int>();

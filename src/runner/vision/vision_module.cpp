@@ -2,6 +2,11 @@
 #include "IVisionAdapter.hpp"
 #include "audio_encoder.hpp"
 
+#if defined(AXLLM_HAVE_LIBJPEG)
+#include <jpeglib.h>
+#include <csetjmp>
+#endif
+
 #include <cctype>
 #include <algorithm>
 #include <atomic>
@@ -145,8 +150,105 @@ static std::string make_temp_png_path()
     return (dir / ("decoded_" + std::to_string(now) + "_" + std::to_string(seq++) + ".png")).string();
 }
 
+#if defined(AXLLM_HAVE_LIBJPEG)
+struct JpegErrorManager
+{
+    jpeg_error_mgr pub;
+    jmp_buf jump;
+};
+
+static void jpeg_error_exit(j_common_ptr cinfo)
+{
+    auto* err = reinterpret_cast<JpegErrorManager*>(cinfo->err);
+    longjmp(err->jump, 1);
+}
+
+static bool is_jpeg_file(const std::string& path)
+{
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) return false;
+    unsigned char head[2] = {0};
+    ifs.read(reinterpret_cast<char*>(head), sizeof(head));
+    return ifs.gcount() == 2 && head[0] == 0xff && head[1] == 0xd8;
+}
+
+// Decode JPEG directly at a reduced DCT scale. This avoids decoding a 1080p/4K
+// image at full resolution just to shrink it to the vision encoder input size.
+static axcv::Mat imread_jpeg_scaled(const std::string& file, int min_side)
+{
+    FILE* fp = std::fopen(file.c_str(), "rb");
+    if (!fp) return axcv::Mat();
+
+    jpeg_decompress_struct cinfo;
+    std::memset(&cinfo, 0, sizeof(cinfo));
+    JpegErrorManager jerr;
+    cinfo.err = jpeg_std_error(&jerr.pub);
+    jerr.pub.error_exit = jpeg_error_exit;
+
+    jpeg_create_decompress(&cinfo);
+    if (setjmp(jerr.jump))
+    {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(fp);
+        return axcv::Mat();
+    }
+
+    jpeg_stdio_src(&cinfo, fp);
+    jpeg_read_header(&cinfo, TRUE);
+
+    int scale_denom = 1;
+    const int min_dim = std::min(cinfo.image_width, cinfo.image_height);
+    while (scale_denom < 8 && min_dim / (scale_denom * 2) >= min_side)
+        scale_denom *= 2;
+
+    cinfo.scale_num = 1;
+    cinfo.scale_denom = scale_denom;
+    cinfo.out_color_space = JCS_RGB;
+    cinfo.dct_method = JDCT_IFAST;
+    jpeg_start_decompress(&cinfo);
+
+    const int w = (int)cinfo.output_width;
+    const int h = (int)cinfo.output_height;
+    if (w <= 0 || h <= 0 || cinfo.output_components != 3)
+    {
+        jpeg_destroy_decompress(&cinfo);
+        std::fclose(fp);
+        return axcv::Mat();
+    }
+
+    axcv::Mat out = axcv::create_mat(h, w, 3);
+    std::vector<JSAMPLE> row((size_t)w * 3);
+    while (cinfo.output_scanline < cinfo.output_height)
+    {
+        JSAMPROW row_ptr = row.data();
+        jpeg_read_scanlines(&cinfo, &row_ptr, 1);
+        const int y = (int)cinfo.output_scanline - 1;
+        uint8_t* dst = axcv::row_ptr(out, y);
+        for (int x = 0; x < w; ++x)
+        {
+            dst[3 * x + 0] = row[3 * x + 2]; // B
+            dst[3 * x + 1] = row[3 * x + 1]; // G
+            dst[3 * x + 2] = row[3 * x + 0]; // R
+        }
+    }
+
+    jpeg_finish_decompress(&cinfo);
+    jpeg_destroy_decompress(&cinfo);
+    std::fclose(fp);
+    ALOGI("JPEG reduced decode: %s -> %dx%d (scale 1/%d)", file.c_str(), w, h, scale_denom);
+    return out;
+}
+#endif
+
 static axcv::Mat imread_with_webp_fallback(const std::string& file, int flags, std::string* err_detail = nullptr)
 {
+#if defined(AXLLM_HAVE_LIBJPEG)
+    if (is_jpeg_file(file))
+    {
+        axcv::Mat scaled = imread_jpeg_scaled(file, 384);
+        if (!axcv::empty(scaled)) return scaled;
+    }
+#endif
     axcv::Mat img = axcv::imread(file, flags);
     if (!axcv::empty(img)) return img;
 
@@ -1584,12 +1686,17 @@ bool VisionModule::EncodeForContent(const Content& content,
             }
 
             std::string decode_detail;
+            const auto t_decode_begin = std::chrono::steady_clock::now();
             axcv::Mat img = imread_with_webp_fallback(file, axcv::IMREAD_COLOR, &decode_detail);
+            const auto t_decode_end = std::chrono::steady_clock::now();
             if (axcv::empty(img)) {
                 err = "failed to read image: " + file + " (" + file_probe_summary(file) + ")";
                 if (!decode_detail.empty()) err += " " + decode_detail;
                 return false;
             }
+            ALOGI("image decode: %.2f ms (%dx%d)",
+                  std::chrono::duration<double, std::milli>(t_decode_end - t_decode_begin).count(),
+                  axcv::width(img), axcv::height(img));
 
             std::vector<std::vector<unsigned short>> blocks_for_one;
             std::vector<std::vector<float>> deepstack_for_one;
@@ -1599,7 +1706,12 @@ bool VisionModule::EncodeForContent(const Content& content,
             // The generic encode (encode_block_*/encode_classic_image, which owns the
             // vision encoder) stays here.
             ImagePreproc pp;
+            const auto t_pre_begin = std::chrono::steady_clock::now();
             if (!adapter_->preprocessImage(img, vp_img, pp, err)) return false;
+            const auto t_pre_end = std::chrono::steady_clock::now();
+            ALOGI("image preprocess: %.2f ms",
+                  std::chrono::duration<double, std::milli>(t_pre_end - t_pre_begin).count());
+            const auto t_enc_begin = std::chrono::steady_clock::now();
             if (pp.mode == ImagePreproc::ClassicMat) {
                 std::vector<unsigned short> emb;
                 if (!encode_classic_image(impl_->encoder, devid, impl_->encoder_output_is_bf16,
@@ -1624,6 +1736,9 @@ bool VisionModule::EncodeForContent(const Content& content,
                     blocks_for_one.push_back(std::move(emb));
                 }
             }
+            const auto t_enc_end = std::chrono::steady_clock::now();
+            ALOGI("vision encode: %.2f ms",
+                  std::chrono::duration<double, std::milli>(t_enc_end - t_enc_begin).count());
 
             if (cache_enabled_) {
                 ALOGI("vision cache store: %s", file.c_str());

@@ -46,6 +46,7 @@ public:
 
     bool multi_slot_enabled() const { return multi_slot_enabled_; }
     bool multi_slot_active_request() const { return multi_slot_active_request_; }
+    int active_slot_index() const { return multi_slot_enabled_ ? kv_active_slot_idx_ : -1; }
 
     // ---- Multi-slot prefix KV cache management ----
     // Called from Init() after layers/groups are ready. Estimates how many slots

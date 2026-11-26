@@ -72,6 +72,19 @@ struct LLMAttrType {
     // "host" (DDR copy on switch, reserved for a follow-up).
     std::string kv_cache_slot_location = "device";
 
+    // Capture linear-attention K/V state after each prefill for multi-turn
+    // prefix reuse / token rollback. Disabling this removes a large D2H copy
+    // from the first-token path (~170 ms on Qwen3.5 C192) at the cost of
+    // recomputing the prompt when a later turn reuses a prefix.
+    bool linear_state_snapshot = true;
+    // Keep those snapshots in CMM and copy with D2D instead of doing a host
+    // D2H/H2D round trip. Requires an on-chip AX650 build.
+    bool linear_state_snapshot_d2d = false;
+    // Copy each linear layer's K/V on a worker thread while the next layer is
+    // running on the NPU, instead of doing one synchronous D2H block after
+    // prefill.
+    bool linear_state_snapshot_async = false;
+
     // ---- Pre-load memory guard (avoid loading models that overflow CMM/DDR
     //      and crash the NPU driver) ----
     // Before loading each piece (layer / post / vision & audio encoders / token

@@ -254,6 +254,13 @@ struct LLM::Impl : public IKvSlotHost {
     int get_last_prefill_tokens() const { return last_run_prefill_tokens_; }
     std::vector<std::vector<unsigned short>> k_caches, v_caches;
     axllm::qwen3_5::LinearStateStore linear_state_snapshots_;
+    // Persistent D2D buffers reused across independent single-turn requests.
+    // The snapshot store is cleared by ResetKVCache between requests; keeping
+    // these allocations here avoids 36 CMM alloc/free cycles per prefill.
+    std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_k_;
+    std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_v_;
+    struct AsyncLinearSnapshotContext;
+    std::map<int, std::unique_ptr<AsyncLinearSnapshotContext>> async_linear_snapshots_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
@@ -918,27 +925,431 @@ struct LLM::Impl : public IKvSlotHost {
         return linear_state_snapshots_.best_len(token_len);
     }
 
+#ifndef USE_AXCL
+    static axllm::qwen3_5::DeviceBuffer alloc_linear_snapshot_device_buffer(size_t size)
+    {
+        axllm::qwen3_5::DeviceBuffer buffer;
+        if (size == 0) return buffer;
+
+        AX_U64 phy = 0;
+        void *vir = nullptr;
+        const int ret = AX_SYS_MemAllocCached(&phy,
+                                              &vir,
+                                              size,
+                                              128,
+                                              (const AX_S8 *)"npu");
+        if (ret != 0 || !vir)
+        {
+            ALOGE("linear snapshot: AX_SYS_MemAllocCached(%zu) failed: 0x%x", size, ret);
+            return buffer;
+        }
+
+        // The snapshot buffer is only accessed by the CPU (D2D source/dest is
+        // copied by memcpy in llm_d2d). It is never read by the NPU, so it does
+        // not need to participate in CmmFlushRegistry cache maintenance.
+        auto deleter = [phy](void *ptr)
+        {
+            if (!ptr) return;
+            AX_SYS_MemFree(phy, ptr);
+        };
+        buffer.vir = vir;
+        buffer.phy = (unsigned long long)phy;
+        buffer.size = size;
+        buffer.owner = std::shared_ptr<void>(vir, deleter);
+        return buffer;
+    }
+#endif
+
+    struct AsyncLinearSnapshotJob
+    {
+        int layer = -1;
+        const void *k = nullptr;
+        size_t k_size = 0;
+        const void *v = nullptr;
+        size_t v_size = 0;
+        int devid = 0;
+    };
+
+    struct AsyncLinearSnapshotContext
+    {
+        int slot_idx = -1;
+        int token_len = 0;
+        LinearStateSnapshot snapshot;
+        std::thread worker;
+        std::mutex mtx;
+        std::condition_variable cv;
+        std::deque<AsyncLinearSnapshotJob> jobs;
+        bool stop = false;
+        std::atomic<bool> failed{false};
+
+        ~AsyncLinearSnapshotContext()
+        {
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                stop = true;
+            }
+            cv.notify_all();
+            if (worker.joinable()) worker.join();
+        }
+    };
+
+    void async_linear_snapshot_worker(AsyncLinearSnapshotContext &ctx)
+    {
+        for (;;)
+        {
+            AsyncLinearSnapshotJob job;
+            {
+                std::unique_lock<std::mutex> lock(ctx.mtx);
+                ctx.cv.wait(lock, [&ctx] { return ctx.stop || !ctx.jobs.empty(); });
+                if (ctx.jobs.empty())
+                {
+                    if (ctx.stop) break;
+                    continue;
+                }
+                job = std::move(ctx.jobs.front());
+                ctx.jobs.pop_front();
+            }
+
+            if (job.layer < 0 || job.layer >= (int)ctx.snapshot.k.size() ||
+                job.layer >= (int)ctx.snapshot.v.size())
+            {
+                ctx.failed.store(true);
+                continue;
+            }
+
+            try
+            {
+                auto &k = ctx.snapshot.k[(size_t)job.layer];
+                auto &v = ctx.snapshot.v[(size_t)job.layer];
+                k.resize(job.k_size);
+                v.resize(job.v_size);
+                llm_d2h(k.data(), job.k, job.k_size, job.devid);
+                llm_d2h(v.data(), job.v, job.v_size, job.devid);
+            }
+            catch (...)
+            {
+                ctx.failed.store(true);
+            }
+        }
+    }
+
+    bool start_async_linear_snapshot(int slot_idx, int token_len)
+    {
+        // Plan A: requests are serialized by the server, so at most one
+        // snapshot worker may be active. Refuse to start another slot's worker
+        // instead of silently destroying it; the caller skips snapshot for this run.
+        for (const auto &entry : async_linear_snapshots_)
+        {
+            if (entry.second && entry.first != slot_idx)
+            {
+                ALOGE("async linear snapshot already active for slot %d; refuse slot %d",
+                      entry.first, slot_idx);
+                return false;
+            }
+        }
+
+        auto &slot_ctx = async_linear_snapshots_[slot_idx];
+        slot_ctx.reset();
+        slot_ctx = std::make_unique<AsyncLinearSnapshotContext>();
+        auto &ctx = *slot_ctx;
+        ctx.slot_idx = slot_idx;
+        ctx.token_len = token_len;
+        ctx.snapshot.token_len = token_len;
+        ctx.snapshot.k.resize((size_t)_attr.axmodel_num);
+        ctx.snapshot.v.resize((size_t)_attr.axmodel_num);
+        ctx.worker = std::thread([this, &ctx] { async_linear_snapshot_worker(ctx); });
+        return true;
+    }
+
+    void enqueue_async_linear_snapshot(int slot_idx, int layer, const void *k, size_t k_size,
+                                       const void *v, size_t v_size, int devid)
+    {
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second || !k || !v) return;
+        auto &ctx = *it->second;
+        if (ctx.slot_idx != slot_idx) return;
+        {
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.jobs.push_back(
+                AsyncLinearSnapshotJob{layer, k, k_size, v, v_size, devid});
+        }
+        ctx.cv.notify_one();
+    }
+
+    void abort_async_linear_snapshot(int slot_idx)
+    {
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second) return;
+        auto &ctx = *it->second;
+        {
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.stop = true;
+            ctx.jobs.clear();
+        }
+        ctx.cv.notify_all();
+        if (ctx.worker.joinable()) ctx.worker.join();
+        ALOGW("async linear snapshot aborted (slot=%d token_len=%d)", slot_idx, ctx.token_len);
+        async_linear_snapshots_.erase(it);
+    }
+
+    struct AsyncSnapshotAbortGuard
+    {
+        Impl *impl = nullptr;
+        int slot_idx = -1;
+        bool armed = false;
+
+        AsyncSnapshotAbortGuard() = default;
+        ~AsyncSnapshotAbortGuard() { abort(); }
+
+        void arm(Impl *owner, int slot)
+        {
+            impl = owner;
+            slot_idx = slot;
+            armed = true;
+        }
+
+        void release()
+        {
+            armed = false;
+        }
+
+        void abort()
+        {
+            if (!armed) return;
+            armed = false;
+            if (impl) impl->abort_async_linear_snapshot(slot_idx);
+        }
+    };
+
+    bool finish_async_linear_snapshot(int slot_idx)
+    {
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second) return true;
+        auto &ctx = *it->second;
+        const bool context_slot_ok = (ctx.slot_idx == slot_idx);
+        if (!context_slot_ok)
+        {
+            ALOGE("async linear snapshot context slot mismatch: expected=%d actual=%d",
+                  slot_idx, ctx.slot_idx);
+        }
+        {
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.stop = true;
+        }
+        ctx.cv.notify_all();
+        if (ctx.worker.joinable()) ctx.worker.join();
+
+        const int token_len = ctx.token_len;
+        bool ok = context_slot_ok && !ctx.failed.load();
+        if (ok && slot_idx >= 0 && kv_mgr_.multi_slot_enabled() &&
+            kv_mgr_.active_slot_index() != slot_idx)
+        {
+            ALOGE("async linear snapshot slot changed before finish: expected=%d active=%d",
+                  slot_idx, kv_mgr_.active_slot_index());
+            ok = false;
+        }
+        if (ok)
+        {
+            // Plan A keeps Run() serialized. The working store is the active
+            // slot's mirror and is committed to KvCacheSlot by save_active_kv_slot()
+            // at the end of Run(); this also keeps the same-slot continuation fast.
+            auto *existing = linear_state_snapshots_.find(token_len);
+            if (existing)
+                *existing = std::move(ctx.snapshot);
+            else
+                linear_state_snapshots_.items().push_back(std::move(ctx.snapshot));
+            ALOGI("async linear snapshot finished (slot=%d token_len=%d)", slot_idx, token_len);
+        }
+        else
+        {
+            ALOGE("async linear snapshot failed (slot=%d token_len=%d)", slot_idx, token_len);
+        }
+
+        async_linear_snapshots_.erase(it);
+        return ok;
+    }
+
     void capture_linear_state_snapshot(int token_len)
     {
         if (token_len <= 0 || !has_linear_attention_layers()) return;
 
         LinearStateSnapshot snapshot;
         snapshot.token_len = token_len;
-        snapshot.k.resize((size_t)_attr.axmodel_num);
-        snapshot.v.resize((size_t)_attr.axmodel_num);
 
-        for (int i = 0; i < _attr.axmodel_num; ++i)
+#ifdef USE_AXCL
+        const bool want_device_snapshot = false;
+#else
+        // The persistent pool is shared by the single snapshot store. Keep the
+        // D2D experiment single-slot until per-slot pools are implemented.
+        const bool want_device_snapshot = _attr.linear_state_snapshot_d2d &&
+                                          _attr.kv_cache_slots <= 1;
+#endif
+
+        // ResetKVCache() clears the snapshot store between independent requests.
+        // Reuse the persistent pool in that case instead of allocating 36 CMM
+        // blocks again for the same-shape prefill.
+        if (want_device_snapshot && linear_state_snapshots_.items().empty() &&
+            linear_snapshot_pool_k_.size() >= (size_t)_attr.axmodel_num &&
+            linear_snapshot_pool_v_.size() >= (size_t)_attr.axmodel_num)
         {
-            if (!is_linear_layer(i)) continue;
+            bool pool_ok = true;
+            size_t device_bytes = 0;
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                if (!is_linear_layer(i)) continue;
+                auto &lyr = llama_layers[(size_t)i];
+                const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+                if (!linear_snapshot_pool_k_[(size_t)i].owner ||
+                    !linear_snapshot_pool_v_[(size_t)i].owner ||
+                    linear_snapshot_pool_k_[(size_t)i].size != (size_t)t_k.nSize ||
+                    linear_snapshot_pool_v_[(size_t)i].size != (size_t)t_v.nSize)
+                {
+                    pool_ok = false;
+                    break;
+                }
+                device_bytes += linear_snapshot_pool_k_[(size_t)i].size;
+                device_bytes += linear_snapshot_pool_v_[(size_t)i].size;
+            }
+            if (pool_ok)
+            {
+                LinearStateSnapshot snapshot;
+                snapshot.token_len = token_len;
+                snapshot.device_backed = true;
+                snapshot.device_k = linear_snapshot_pool_k_;
+                snapshot.device_v = linear_snapshot_pool_v_;
+                for (int i = 0; i < _attr.axmodel_num; ++i)
+                {
+                    if (!is_linear_layer(i)) continue;
+                    auto &lyr = llama_layers[(size_t)i];
+                    const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                    const int devid = LLM_DEVID(lyr);
+                    auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                    auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+                    llm_d2d(snapshot.device_k[(size_t)i].vir, LLM_RADDR(t_k), t_k.nSize, devid);
+                    llm_d2d(snapshot.device_v[(size_t)i].vir, LLM_RADDR(t_v), t_v.nSize, devid);
+                }
+                linear_state_snapshots_.items().push_back(std::move(snapshot));
+                ALOGI("linear state snapshot: device D2D pool %zu bytes (token_len=%d)", device_bytes, token_len);
+                return;
+            }
+        }
 
-            auto &lyr = llama_layers[(size_t)i];
-            const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
-            auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
-            auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
-            snapshot.k[(size_t)i].resize((size_t)t_k.nSize);
-            snapshot.v[(size_t)i].resize((size_t)t_v.nSize);
-            llm_d2h(snapshot.k[(size_t)i].data(), LLM_RADDR(t_k), t_k.nSize, LLM_DEVID(lyr));
-            llm_d2h(snapshot.v[(size_t)i].data(), LLM_RADDR(t_v), t_v.nSize, LLM_DEVID(lyr));
+        // Reuse the device buffers when the same token length is captured
+        // again (the normal single-turn case). Allocating 36 CMM blocks per
+        // request costs far more than the actual D2D copy.
+        LinearStateSnapshot *reusable = linear_state_snapshots_.find(token_len);
+        if (want_device_snapshot && reusable && reusable->device_backed)
+        {
+            bool reuse_ok = true;
+            size_t device_bytes = 0;
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                if (!is_linear_layer(i)) continue;
+                auto &lyr = llama_layers[(size_t)i];
+                const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+                if (reusable->device_k.size() < (size_t)_attr.axmodel_num ||
+                    reusable->device_v.size() < (size_t)_attr.axmodel_num ||
+                    !reusable->device_k[(size_t)i].owner ||
+                    !reusable->device_v[(size_t)i].owner ||
+                    reusable->device_k[(size_t)i].size != (size_t)t_k.nSize ||
+                    reusable->device_v[(size_t)i].size != (size_t)t_v.nSize)
+                {
+                    reuse_ok = false;
+                    break;
+                }
+                device_bytes += reusable->device_k[(size_t)i].size;
+                device_bytes += reusable->device_v[(size_t)i].size;
+            }
+            if (reuse_ok)
+            {
+                for (int i = 0; i < _attr.axmodel_num; ++i)
+                {
+                    if (!is_linear_layer(i)) continue;
+                    auto &lyr = llama_layers[(size_t)i];
+                    const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                    const int devid = LLM_DEVID(lyr);
+                    auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                    auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+                    llm_d2d(reusable->device_k[(size_t)i].vir, LLM_RADDR(t_k), t_k.nSize, devid);
+                    llm_d2d(reusable->device_v[(size_t)i].vir, LLM_RADDR(t_v), t_v.nSize, devid);
+                }
+                ALOGI("linear state snapshot: device D2D reused %zu bytes (token_len=%d)", device_bytes, token_len);
+                return;
+            }
+        }
+
+        if (want_device_snapshot)
+        {
+#ifndef USE_AXCL
+            snapshot.device_k.resize((size_t)_attr.axmodel_num);
+            snapshot.device_v.resize((size_t)_attr.axmodel_num);
+            bool device_ok = true;
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                if (!is_linear_layer(i)) continue;
+
+                auto &lyr = llama_layers[(size_t)i];
+                const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                const int devid = LLM_DEVID(lyr);
+                auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+
+                snapshot.device_k[(size_t)i] = alloc_linear_snapshot_device_buffer((size_t)t_k.nSize);
+                snapshot.device_v[(size_t)i] = alloc_linear_snapshot_device_buffer((size_t)t_v.nSize);
+                if (!snapshot.device_k[(size_t)i].owner || !snapshot.device_v[(size_t)i].owner)
+                {
+                    device_ok = false;
+                    break;
+                }
+
+                llm_d2d(snapshot.device_k[(size_t)i].vir, LLM_RADDR(t_k), t_k.nSize, devid);
+                llm_d2d(snapshot.device_v[(size_t)i].vir, LLM_RADDR(t_v), t_v.nSize, devid);
+            }
+
+            if (device_ok)
+            {
+                snapshot.device_backed = true;
+                if (linear_snapshot_pool_k_.empty())
+                {
+                    linear_snapshot_pool_k_ = snapshot.device_k;
+                    linear_snapshot_pool_v_ = snapshot.device_v;
+                }
+                size_t device_bytes = 0;
+                for (const auto &buffer : snapshot.device_k) device_bytes += buffer.size;
+                for (const auto &buffer : snapshot.device_v) device_bytes += buffer.size;
+                ALOGI("linear state snapshot: device D2D %zu bytes (token_len=%d)", device_bytes, token_len);
+            }
+            else
+            {
+                // Release any partial device allocations and fall back to host.
+                snapshot.device_k.clear();
+                snapshot.device_v.clear();
+            }
+#endif
+        }
+
+        if (!snapshot.device_backed)
+        {
+            snapshot.k.resize((size_t)_attr.axmodel_num);
+            snapshot.v.resize((size_t)_attr.axmodel_num);
+
+            for (int i = 0; i < _attr.axmodel_num; ++i)
+            {
+                if (!is_linear_layer(i)) continue;
+
+                auto &lyr = llama_layers[(size_t)i];
+                const int layer_decode_grpid = decode_gid_for_layer(i, decode_grpid);
+                auto &t_k = lyr.layer.get_input(layer_decode_grpid, "K_cache");
+                auto &t_v = lyr.layer.get_input(layer_decode_grpid, "V_cache");
+                snapshot.k[(size_t)i].resize((size_t)t_k.nSize);
+                snapshot.v[(size_t)i].resize((size_t)t_v.nSize);
+                llm_d2h(snapshot.k[(size_t)i].data(), LLM_RADDR(t_k), t_k.nSize, LLM_DEVID(lyr));
+                llm_d2h(snapshot.v[(size_t)i].data(), LLM_RADDR(t_v), t_v.nSize, LLM_DEVID(lyr));
+            }
         }
 
         auto *existing = linear_state_snapshots_.find(token_len);
@@ -956,6 +1367,10 @@ struct LLM::Impl : public IKvSlotHost {
         if (!it)
             return false;
 
+        ALOGI("linear state snapshot restore: %s (token_len=%d)",
+              it->device_backed ? "device D2D" : "host H2D",
+              token_len);
+
         for (int i = 0; i < _attr.axmodel_num; ++i)
         {
             if (!is_linear_layer(i)) continue;
@@ -965,17 +1380,42 @@ struct LLM::Impl : public IKvSlotHost {
             const int src_gid = decode_gid_for_layer(i, decode_grpid);
             auto &dst_k = lyr.layer.get_input(src_gid, "K_cache");
             auto &dst_v = lyr.layer.get_input(src_gid, "V_cache");
-            const auto &snapshot_k = it->k[(size_t)i];
-            const auto &snapshot_v = it->v[(size_t)i];
-            if (snapshot_k.size() != (size_t)dst_k.nSize || snapshot_v.size() != (size_t)dst_v.nSize)
-            {
-                ALOGE("linear snapshot size mismatch: layer=%d token_len=%d K=%zu/%u V=%zu/%u",
-                      i, token_len, snapshot_k.size(), dst_k.nSize, snapshot_v.size(), dst_v.nSize);
-                return false;
-            }
             if (!LLM_WADDR(dst_k) || !LLM_WADDR(dst_v)) return false;
-            llm_h2d(LLM_WADDR(dst_k), snapshot_k.data(), snapshot_k.size(), devid);
-            llm_h2d(LLM_WADDR(dst_v), snapshot_v.data(), snapshot_v.size(), devid);
+
+            if (it->device_backed)
+            {
+                if (it->device_k.size() < (size_t)_attr.axmodel_num ||
+                    it->device_v.size() < (size_t)_attr.axmodel_num)
+                {
+                    ALOGE("linear snapshot device storage is incomplete: layer=%d token_len=%d", i, token_len);
+                    return false;
+                }
+                const auto &snapshot_k = it->device_k[(size_t)i];
+                const auto &snapshot_v = it->device_v[(size_t)i];
+                if (!snapshot_k.owner || !snapshot_v.owner ||
+                    snapshot_k.size != (size_t)dst_k.nSize ||
+                    snapshot_v.size != (size_t)dst_v.nSize)
+                {
+                    ALOGE("linear snapshot device size mismatch: layer=%d token_len=%d K=%zu/%u V=%zu/%u",
+                          i, token_len, snapshot_k.size, dst_k.nSize, snapshot_v.size, dst_v.nSize);
+                    return false;
+                }
+                llm_d2d(LLM_WADDR(dst_k), snapshot_k.vir, snapshot_k.size, devid);
+                llm_d2d(LLM_WADDR(dst_v), snapshot_v.vir, snapshot_v.size, devid);
+            }
+            else
+            {
+                const auto &snapshot_k = it->k[(size_t)i];
+                const auto &snapshot_v = it->v[(size_t)i];
+                if (snapshot_k.size() != (size_t)dst_k.nSize || snapshot_v.size() != (size_t)dst_v.nSize)
+                {
+                    ALOGE("linear snapshot size mismatch: layer=%d token_len=%d K=%zu/%u V=%zu/%u",
+                          i, token_len, snapshot_k.size(), dst_k.nSize, snapshot_v.size(), dst_v.nSize);
+                    return false;
+                }
+                llm_h2d(LLM_WADDR(dst_k), snapshot_k.data(), snapshot_k.size(), devid);
+                llm_h2d(LLM_WADDR(dst_v), snapshot_v.data(), snapshot_v.size(), devid);
+            }
 
             std::vector<int> state_gids = {src_gid};
             if (i < (int)layer_decode_grpids_.size())
