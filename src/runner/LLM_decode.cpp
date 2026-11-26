@@ -311,15 +311,16 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 
     const bool skip_linear_snapshot = !_attr.linear_state_snapshot ||
                                       std::getenv("AXLLM_DISABLE_LINEAR_SNAPSHOT") != nullptr;
-#ifdef USE_AXCL
-    const bool async_linear_snapshot = false;
-#else
-    const bool async_linear_snapshot = !skip_linear_snapshot &&
-                                       _attr.linear_state_snapshot_async &&
-                                       has_linear_attention_layers();
+    bool async_linear_snapshot = false;
+#ifndef USE_AXCL
+    async_linear_snapshot = !skip_linear_snapshot &&
+                            _attr.linear_state_snapshot_async &&
+                            has_linear_attention_layers();
 #endif
-    if (async_linear_snapshot)
-        start_async_linear_snapshot(precompute_len + input_embed_num);
+    const int async_slot_idx = kv_mgr_.multi_slot_enabled() ? kv_mgr_.active_slot_index() : -1;
+    bool async_start_failed = false;
+    bool async_guard_armed = false;
+    AsyncSnapshotAbortGuard async_guard;
 
     const bool use_per_layer_input = gemma4_per_layer_helper.enabled();
     const int per_layer_hidden = gemma4_per_layer_helper.hidden_size_per_layer_input();
@@ -392,6 +393,23 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         size_t copy_tokens = (p == prefill_split_num - 1) ? (size_t)(input_embed_num - p * _attr.prefill_token_num) : (size_t)_attr.prefill_token_num;
         memcpy(embed_tmp.data(), test_embed.data() + p * _attr.prefill_token_num * _attr.tokens_embed_size, copy_tokens * _attr.tokens_embed_size * sizeof(unsigned short));
         scale_prefill_text_embeds_inplace(embed_tmp.data(), input_num_token, token_start_pos);
+
+        if (async_linear_snapshot)
+        {
+            const int chunk_token_len = history_len + input_num_token;
+            if (!start_async_linear_snapshot(async_slot_idx, chunk_token_len))
+            {
+                ALOGW("async linear snapshot start failed for chunk p=%d; skip snapshot", p);
+                async_linear_snapshot = false;
+                async_start_failed = true;
+            }
+            else if (!async_guard_armed)
+            {
+                async_guard.arm(this, async_slot_idx);
+                async_guard_armed = true;
+            }
+        }
+
         if (std::getenv("AXLLM_DEBUG_DECODE_TRACE") && p == 0 && input_num_token > 0)
         {
             const unsigned short *last_token_embed =
@@ -626,9 +644,10 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                 }
             }
 
-            if (async_linear_snapshot && p == prefill_split_num - 1 && linear_prefill)
+            if (async_linear_snapshot && linear_prefill)
             {
-                enqueue_async_linear_snapshot(m,
+                enqueue_async_linear_snapshot(async_slot_idx,
+                                              m,
                                               LLM_RADDR(dec_k),
                                               (size_t)dec_k.nSize,
                                               LLM_RADDR(dec_v),
@@ -683,7 +702,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
 
         mark_full_cache_slots(history_len, input_num_token);
         const bool profile_prefill = std::getenv("AXLLM_PROFILE_PREFILL") != nullptr;
-        if (!skip_linear_snapshot && !async_linear_snapshot)
+        if (!skip_linear_snapshot && !async_linear_snapshot && !async_start_failed)
         {
             const auto snapshot_t0 = profile_prefill ? DecodeClock::now() : DecodeClock::time_point{};
             capture_linear_state_snapshot(history_len + input_num_token);
@@ -703,8 +722,27 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
         }
         else if (profile_prefill)
         {
-            ALOGI("prefill linear snapshot: %s", skip_linear_snapshot ? "skipped" : "async");
+            const char *snapshot_state = skip_linear_snapshot ? "skipped"
+                                         : async_start_failed ? "failed"
+                                         : "async";
+            ALOGI("prefill linear snapshot: %s", snapshot_state);
         }
+
+        if (async_linear_snapshot && p != prefill_split_num - 1)
+        {
+            const auto chunk_wait_t0 = DecodeClock::now();
+            const bool chunk_ok = finish_async_linear_snapshot(async_slot_idx);
+            const double chunk_wait_ms =
+                (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - chunk_wait_t0).count() / 1000.0;
+            ALOGI("async linear snapshot chunk wait before next prefill: p=%d %.2f ms (%s)",
+                  p, chunk_wait_ms, chunk_ok ? "ok" : "failed");
+            if (!chunk_ok)
+            {
+                async_linear_snapshot = false;
+                async_start_failed = true;
+            }
+        }
+
         if (p == prefill_split_num - 1)
             memcpy(embed.data(), embed_tmp.data() + (input_embed_num - p * _attr.prefill_token_num - 1) * _attr.tokens_embed_size, _attr.tokens_embed_size * sizeof(unsigned short));
     }
@@ -799,7 +837,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
     if (async_linear_snapshot)
     {
         const auto wait_t0 = DecodeClock::now();
-        const bool snapshot_ok = finish_async_linear_snapshot();
+        const bool snapshot_ok = finish_async_linear_snapshot(async_slot_idx);
         const double wait_ms =
             (double)std::chrono::duration_cast<std::chrono::microseconds>(DecodeClock::now() - wait_t0).count() / 1000.0;
         ALOGI("async linear snapshot wait after first token: %.2f ms (%s)",
@@ -811,6 +849,7 @@ std::string LLM::Impl::Run(std::vector<unsigned short> &test_embed, int output_m
                   restore_ok ? "ok" : "FAILED",
                   precompute_len + input_embed_num);
         }
+        async_guard.release();
     }
 
     t_cost.start();

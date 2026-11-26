@@ -260,7 +260,7 @@ struct LLM::Impl : public IKvSlotHost {
     std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_k_;
     std::vector<axllm::qwen3_5::DeviceBuffer> linear_snapshot_pool_v_;
     struct AsyncLinearSnapshotContext;
-    std::unique_ptr<AsyncLinearSnapshotContext> async_linear_snapshot_;
+    std::map<int, std::unique_ptr<AsyncLinearSnapshotContext>> async_linear_snapshots_;
     int precompute_len = 0;
     std::vector<int> prefill_history_kv_cache_num_grp;
     std::vector<int> prefill_symbolic_kv_cache_num_grp;
@@ -972,6 +972,7 @@ struct LLM::Impl : public IKvSlotHost {
 
     struct AsyncLinearSnapshotContext
     {
+        int slot_idx = -1;
         int token_len = 0;
         LinearStateSnapshot snapshot;
         std::thread worker;
@@ -1032,34 +1033,105 @@ struct LLM::Impl : public IKvSlotHost {
         }
     }
 
-    void start_async_linear_snapshot(int token_len)
+    bool start_async_linear_snapshot(int slot_idx, int token_len)
     {
-        async_linear_snapshot_.reset();
-        async_linear_snapshot_ = std::make_unique<AsyncLinearSnapshotContext>();
-        auto &ctx = *async_linear_snapshot_;
+        // Plan A: requests are serialized by the server, so at most one
+        // snapshot worker may be active. Refuse to start another slot's worker
+        // instead of silently destroying it; the caller skips snapshot for this run.
+        for (const auto &entry : async_linear_snapshots_)
+        {
+            if (entry.second && entry.first != slot_idx)
+            {
+                ALOGE("async linear snapshot already active for slot %d; refuse slot %d",
+                      entry.first, slot_idx);
+                return false;
+            }
+        }
+
+        auto &slot_ctx = async_linear_snapshots_[slot_idx];
+        slot_ctx.reset();
+        slot_ctx = std::make_unique<AsyncLinearSnapshotContext>();
+        auto &ctx = *slot_ctx;
+        ctx.slot_idx = slot_idx;
         ctx.token_len = token_len;
         ctx.snapshot.token_len = token_len;
         ctx.snapshot.k.resize((size_t)_attr.axmodel_num);
         ctx.snapshot.v.resize((size_t)_attr.axmodel_num);
         ctx.worker = std::thread([this, &ctx] { async_linear_snapshot_worker(ctx); });
+        return true;
     }
 
-    void enqueue_async_linear_snapshot(int layer, const void *k, size_t k_size,
+    void enqueue_async_linear_snapshot(int slot_idx, int layer, const void *k, size_t k_size,
                                        const void *v, size_t v_size, int devid)
     {
-        if (!async_linear_snapshot_ || !k || !v) return;
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second || !k || !v) return;
+        auto &ctx = *it->second;
+        if (ctx.slot_idx != slot_idx) return;
         {
-            std::lock_guard<std::mutex> lock(async_linear_snapshot_->mtx);
-            async_linear_snapshot_->jobs.push_back(
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.jobs.push_back(
                 AsyncLinearSnapshotJob{layer, k, k_size, v, v_size, devid});
         }
-        async_linear_snapshot_->cv.notify_one();
+        ctx.cv.notify_one();
     }
 
-    bool finish_async_linear_snapshot()
+    void abort_async_linear_snapshot(int slot_idx)
     {
-        if (!async_linear_snapshot_) return true;
-        auto &ctx = *async_linear_snapshot_;
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second) return;
+        auto &ctx = *it->second;
+        {
+            std::lock_guard<std::mutex> lock(ctx.mtx);
+            ctx.stop = true;
+            ctx.jobs.clear();
+        }
+        ctx.cv.notify_all();
+        if (ctx.worker.joinable()) ctx.worker.join();
+        ALOGW("async linear snapshot aborted (slot=%d token_len=%d)", slot_idx, ctx.token_len);
+        async_linear_snapshots_.erase(it);
+    }
+
+    struct AsyncSnapshotAbortGuard
+    {
+        Impl *impl = nullptr;
+        int slot_idx = -1;
+        bool armed = false;
+
+        AsyncSnapshotAbortGuard() = default;
+        ~AsyncSnapshotAbortGuard() { abort(); }
+
+        void arm(Impl *owner, int slot)
+        {
+            impl = owner;
+            slot_idx = slot;
+            armed = true;
+        }
+
+        void release()
+        {
+            armed = false;
+        }
+
+        void abort()
+        {
+            if (!armed) return;
+            armed = false;
+            if (impl) impl->abort_async_linear_snapshot(slot_idx);
+        }
+    };
+
+    bool finish_async_linear_snapshot(int slot_idx)
+    {
+        auto it = async_linear_snapshots_.find(slot_idx);
+        if (it == async_linear_snapshots_.end() || !it->second) return true;
+        auto &ctx = *it->second;
+        const bool context_slot_ok = (ctx.slot_idx == slot_idx);
+        if (!context_slot_ok)
+        {
+            ALOGE("async linear snapshot context slot mismatch: expected=%d actual=%d",
+                  slot_idx, ctx.slot_idx);
+        }
         {
             std::lock_guard<std::mutex> lock(ctx.mtx);
             ctx.stop = true;
@@ -1067,21 +1139,33 @@ struct LLM::Impl : public IKvSlotHost {
         ctx.cv.notify_all();
         if (ctx.worker.joinable()) ctx.worker.join();
 
-        const bool ok = !ctx.failed.load();
+        const int token_len = ctx.token_len;
+        bool ok = context_slot_ok && !ctx.failed.load();
+        if (ok && slot_idx >= 0 && kv_mgr_.multi_slot_enabled() &&
+            kv_mgr_.active_slot_index() != slot_idx)
+        {
+            ALOGE("async linear snapshot slot changed before finish: expected=%d active=%d",
+                  slot_idx, kv_mgr_.active_slot_index());
+            ok = false;
+        }
         if (ok)
         {
-            auto *existing = linear_state_snapshots_.find(ctx.token_len);
+            // Plan A keeps Run() serialized. The working store is the active
+            // slot's mirror and is committed to KvCacheSlot by save_active_kv_slot()
+            // at the end of Run(); this also keeps the same-slot continuation fast.
+            auto *existing = linear_state_snapshots_.find(token_len);
             if (existing)
                 *existing = std::move(ctx.snapshot);
             else
                 linear_state_snapshots_.items().push_back(std::move(ctx.snapshot));
-            ALOGI("async linear snapshot finished (token_len=%d)", ctx.token_len);
+            ALOGI("async linear snapshot finished (slot=%d token_len=%d)", slot_idx, token_len);
         }
         else
         {
-            ALOGE("async linear snapshot failed (token_len=%d)", ctx.token_len);
+            ALOGE("async linear snapshot failed (slot=%d token_len=%d)", slot_idx, token_len);
         }
-        async_linear_snapshot_.reset();
+
+        async_linear_snapshots_.erase(it);
         return ok;
     }
 
